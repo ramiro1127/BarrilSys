@@ -17,6 +17,9 @@ from tkinter import ttk, messagebox, simpledialog
 import sqlite3
 import os
 import sys
+import shutil
+import glob
+import traceback
 from datetime import datetime, date
 import json
 
@@ -24,7 +27,106 @@ import json
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────
 APP_TITLE  = "Barril&Barrica"
-DB_FILE = os.path.join(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)), "stock.db")
+
+# Carpeta donde vive el .exe / main.py (normalmente el pendrive)
+APP_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
+
+# Ubicación "remota" (pendrive) — es la que el usuario transporta entre PCs
+REMOTE_DB_FILE = os.path.join(APP_DIR, "stock.db")
+
+# Carpeta local de trabajo en el disco de la PC (nunca en el pendrive).
+# Usamos %LOCALAPPDATA% en Windows; si no existe, caemos a una carpeta junto al home del usuario.
+_local_base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+LOCAL_APP_DIR = os.path.join(_local_base, "BarrilBarrica")
+LOCAL_DB_FILE = os.path.join(LOCAL_APP_DIR, "stock.db")
+
+# Backups automáticos (siempre en disco local, nunca en el pendrive)
+BACKUP_DIR   = os.path.join(LOCAL_APP_DIR, "backups")
+MAX_BACKUPS  = 20                 # cuántos backups se conservan (se borran los más viejos)
+AUTOSAVE_MS  = 5 * 60 * 1000      # cada cuánto se guarda automáticamente al pendrive (5 min)
+
+DB_FILE = LOCAL_DB_FILE  # el resto del programa trabaja SIEMPRE contra la copia local
+
+
+# ─────────────────────────────────────────
+#  SINCRONIZACIÓN CON EL PENDRIVE + BACKUPS
+# ─────────────────────────────────────────
+def _ensure_dirs():
+    os.makedirs(LOCAL_APP_DIR, exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def _timestamp():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def hacer_backup(path_origen, etiqueta=""):
+    """Copia path_origen a la carpeta de backups locales, con fecha/hora en el nombre."""
+    try:
+        if not os.path.exists(path_origen):
+            return None
+        _ensure_dirs()
+        nombre = f"stock_{_timestamp()}{('_' + etiqueta) if etiqueta else ''}.db"
+        destino = os.path.join(BACKUP_DIR, nombre)
+        shutil.copy2(path_origen, destino)
+        _limpiar_backups_viejos()
+        return destino
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _limpiar_backups_viejos():
+    try:
+        backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "stock_*.db")), key=os.path.getmtime)
+        exceso = len(backups) - MAX_BACKUPS
+        for viejo in backups[:max(exceso, 0)]:
+            os.remove(viejo)
+    except Exception:
+        traceback.print_exc()
+
+
+def _copia_atomica(origen, destino):
+    """Copia origen -> destino de forma segura: escribe a un archivo temporal
+    en el mismo destino y recién al final lo renombra (evita dejar el archivo
+    final a medio escribir si se corta la luz o se desconecta el pendrive)."""
+    tmp = destino + ".tmp_copia"
+    shutil.copy2(origen, tmp)
+    os.replace(tmp, destino)
+
+
+def sincronizar_desde_pendrive():
+    """Al abrir el programa: trae la base del pendrive a la PC para trabajar ahí.
+    Devuelve (ok, mensaje)."""
+    _ensure_dirs()
+    try:
+        if os.path.exists(REMOTE_DB_FILE):
+            # Backup de seguridad de lo que había en el pendrive ANTES de tocar nada
+            hacer_backup(REMOTE_DB_FILE, "al_abrir")
+            _copia_atomica(REMOTE_DB_FILE, LOCAL_DB_FILE)
+            return True, "Base copiada desde el pendrive."
+        elif os.path.exists(LOCAL_DB_FILE):
+            # No hay pendrive conectado pero sí una copia local previa
+            return True, "⚠️ No se encontró stock.db en el pendrive. Se usó la última copia local guardada."
+        else:
+            return True, "No existía una base previa: se creará una nueva."
+    except Exception as e:
+        traceback.print_exc()
+        return False, f"No se pudo sincronizar desde el pendrive: {e}"
+
+
+def guardar_hacia_pendrive(silencioso=False):
+    """Al cerrar (o periódicamente): guarda la copia local de vuelta al pendrive.
+    Devuelve (ok, mensaje)."""
+    if not os.path.exists(LOCAL_DB_FILE):
+        return False, "No hay base local para guardar."
+    try:
+        hacer_backup(LOCAL_DB_FILE, "auto")
+        _copia_atomica(LOCAL_DB_FILE, REMOTE_DB_FILE)
+        return True, "Guardado en el pendrive."
+    except Exception as e:
+        traceback.print_exc()
+        return False, f"No se pudo guardar en el pendrive ({e}). Tus datos siguen a salvo en:\n{LOCAL_DB_FILE}"
 
 # Paleta de colores
 C = {
@@ -207,7 +309,7 @@ class Database:
 
     def get_venta_items(self, vid):
         return self.conn.execute("""
-            SELECT vi.*, p.nombre FROM venta_items vi
+            SELECT vi.*, p.id AS codigo, p.nombre FROM venta_items vi
             JOIN productos p ON vi.producto_id = p.id
             WHERE vi.venta_id=?
         """, (vid,)).fetchall()
@@ -1397,6 +1499,14 @@ class App(tk.Tk):
 
         configure_styles()
 
+        # 1) Traer la base del pendrive a la PC antes de abrir nada
+        ok, msg = sincronizar_desde_pendrive()
+        if not ok:
+            messagebox.showerror("Error al sincronizar", msg)
+        elif msg.startswith("⚠️"):
+            messagebox.showwarning("Aviso", msg)
+
+        # 2) Trabajar siempre sobre la copia local (rápida y segura)
         self.db = Database(DB_FILE)
 
         self._build_sidebar()
@@ -1405,6 +1515,15 @@ class App(tk.Tk):
         self._select_tab("dashboard")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 3) Guardado automático periódico hacia el pendrive (silencioso)
+        self.after(AUTOSAVE_MS, self._autosave_periodico)
+
+    def _autosave_periodico(self):
+        ok, msg = guardar_hacia_pendrive(silencioso=True)
+        if not ok:
+            print("Autosave:", msg)
+        self.after(AUTOSAVE_MS, self._autosave_periodico)
 
     def _build_sidebar(self):
         sb = tk.Frame(self, bg=C["surface"], width=190)
@@ -1419,9 +1538,13 @@ class App(tk.Tk):
                  font=("Segoe UI", 16, "bold")).pack(expand=True)
 
         # DB path
-        db_name = os.path.basename(DB_FILE)
-        tk.Label(sb, text=f"📁 {db_name}", bg=C["surface"], fg=C["subtext"],
-                 font=FONT_SMALL, wraplength=170).pack(pady=(10,6), padx=10)
+        db_name = os.path.basename(REMOTE_DB_FILE)
+        tk.Label(sb, text=f"📁 {db_name}  (trabajando en copia local)", bg=C["surface"], fg=C["subtext"],
+                 font=FONT_SMALL, wraplength=170, justify="left").pack(pady=(10,6), padx=10)
+
+        tk.Button(sb, text="💾 Guardar ahora", command=self._guardar_ahora,
+                  bg=C["success"], fg=C["white"], font=FONT_SMALL,
+                  relief="flat", cursor="hand2", pady=4).pack(fill="x", padx=10, pady=(0,6))
 
         tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=12, pady=4)
 
@@ -1448,6 +1571,13 @@ class App(tk.Tk):
         tk.Frame(sb, bg=C["bg"]).pack(expand=True)
         tk.Label(sb, text="v1.0 • SQLite local", bg=C["surface"],
                  fg=C["subtext"], font=FONT_SMALL).pack(pady=12)
+
+    def _guardar_ahora(self):
+        ok, msg = guardar_hacia_pendrive()
+        if ok:
+            messagebox.showinfo("✅ Guardado", msg)
+        else:
+            messagebox.showwarning("No se pudo guardar", msg)
 
     def _build_content(self):
         self.content = tk.Frame(self, bg=C["bg"])
@@ -1490,6 +1620,13 @@ class App(tk.Tk):
 
     def _on_close(self):
         self.db.close()
+        ok, msg = guardar_hacia_pendrive()
+        if not ok:
+            messagebox.showwarning(
+                "No se pudo guardar en el pendrive",
+                f"{msg}\n\nVolvé a conectar el pendrive y usá 'Guardar ahora' "
+                f"o copiá manualmente el archivo:\n{LOCAL_DB_FILE}"
+            )
         self.destroy()
 
 
